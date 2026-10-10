@@ -22,6 +22,7 @@ A Motion Photo is an ordinary JPEG file with two additions:
 
 Usage:
     python motion_photo.py photo.jpg clip.mp4
+    python motion_photo.py photo.png clip.mp4                  # converted to JPEG
     python motion_photo.py photo.jpg clip.mp4 --compress --duration
     python motion_photo.py photo.jpg clip.mp4 --compress --volume 1
     python motion_photo.py photo.jpg clip.mp4 --crop-bars --stretch
@@ -37,6 +38,10 @@ XMP, Primary Item:Length=0, MP4 as the exact file tail); google writes the
 single-JPG Android motion photo for Google Photos; apple writes an iPhone
 Live Photo pair (photo.jpg + photo.mov linked by a matching
 ContentIdentifier UUID, imported as a pair via AirDrop/Mac Photos/iCloud).
+
+The still image may also be PNG (or WebP/BMP/GIF/TIFF): it is converted to
+a high-quality JPEG via ffmpeg before use, and transparent PNGs are
+flattened onto white.
 
 Optional video processing (needs ffmpeg): --compress re-encodes the clip to
 shrink it, and --duration fast-forwards it to a target length (default 3 s).
@@ -80,6 +85,7 @@ from pathlib import Path
 
 SOI = b"\xff\xd8"
 EOI = b"\xff\xd9"
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 XMP_NS = b"http://ns.adobe.com/xap/1.0/\x00"
 EXIF_NS = b"Exif\x00\x00"
 
@@ -941,6 +947,7 @@ def probe_mp4(data: bytes) -> dict:
 MAX_DIMENSION = 1440  # cap for the long edge when compressing (Pixel-class)
 COMPRESS_CRF = "28"
 SPEED_ONLY_CRF = "18"  # retime/crop only, so keep quality high
+STILL_JPEG_QSCALE = "2"  # ffmpeg mjpeg qscale for still conversion (~quality 95)
 DURATION_EPSILON = 0.05  # seconds; videos within this of the target are left alone
 ASPECT_TOLERANCE = 0.002  # relative; below this, aspect differences are sub-pixel
 BAR_MAX_MEAN = 20.0     # a bar line's mean brightness must not exceed this
@@ -949,9 +956,10 @@ BAR_MIN_PIXELS = 4      # narrower strips are left alone (invisible after roundi
 BAR_MAX_FRACTION = 0.2  # never trim more than this fraction per side (false-positive guard)
 
 FFMPEG_INSTALL_HINT = (
-    "video processing (--compress/--duration/--volume/aspect cropping) requires "
-    "ffmpeg; install it (e.g. 'winget install Gyan.FFmpeg' or from "
-    "https://ffmpeg.org/download.html) or pass --ffmpeg PATH"
+    "video processing (--compress/--duration/--volume/aspect cropping) and "
+    "non-JPEG still conversion require ffmpeg; install it (e.g. "
+    "'winget install Gyan.FFmpeg' or from https://ffmpeg.org/download.html) "
+    "or pass --ffmpeg PATH"
 )
 
 
@@ -970,6 +978,93 @@ def resolve_ffmpeg(explicit: str = None) -> Path:
         return Path(imageio_ffmpeg.get_ffmpeg_exe())
     except Exception:
         raise MotionPhotoError(FFMPEG_INSTALL_HINT) from None
+
+
+def detect_still_format(data: bytes):
+    """Format name when ``data`` is a still image this tool can convert, or None.
+
+    JPEG needs no conversion; PNG, WebP, BMP, GIF and TIFF are re-encoded to
+    JPEG by convert_still_to_jpeg().
+    """
+    if data.startswith(PNG_SIGNATURE):
+        return "PNG"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "WebP"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "GIF"
+    if data.startswith(b"BM"):
+        return "BMP"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return "TIFF"
+    return None
+
+
+def _png_ihdr(data: bytes):
+    """(width, height, color_type) from a PNG's IHDR chunk, or None."""
+    if not data.startswith(PNG_SIGNATURE) or len(data) < 26 or data[12:16] != b"IHDR":
+        return None
+    return (int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big"),
+            data[25])
+
+
+def png_has_alpha(data: bytes) -> bool:
+    """True when the PNG carries an alpha channel or a tRNS transparency chunk."""
+    ihdr = _png_ihdr(data)
+    if ihdr is None:
+        return False
+    if ihdr[2] in (4, 6):  # grayscale+alpha, RGBA
+        return True
+    pos = 8  # walk the chunk list: tRNS before IDAT marks palette/RGB transparency
+    while pos + 12 <= len(data):
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        chunk = data[pos + 4:pos + 8]
+        if chunk == b"tRNS":
+            return True
+        if chunk == b"IDAT":
+            return False
+        pos += 12 + length
+    return False
+
+
+def convert_still_to_jpeg(image_path: Path, ffmpeg: Path, data: bytes,
+                          still_format: str) -> bytes:
+    """Re-encode a non-JPEG still (PNG/WebP/BMP/GIF/TIFF) to JPEG bytes.
+
+    PNGs with transparency are flattened onto white (JPEG has no alpha
+    channel); every format is encoded at high quality (qscale 2).
+    """
+    fd, in_name = tempfile.mkstemp(suffix=image_path.suffix.lower() or ".img")
+    os.close(fd)
+    in_path = Path(in_name)
+    fd, out_name = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    out_path = Path(out_name)
+    try:
+        in_path.write_bytes(data)
+        cmd = [str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error",
+               "-i", str(in_path)]
+        ihdr = _png_ihdr(data)
+        if still_format == "PNG" and png_has_alpha(data) and ihdr:
+            width, height, _ = ihdr
+            cmd += ["-filter_complex",
+                    f"color=c=white:s={width}x{height}[bg];"
+                    "[bg][0:v]overlay=0:0:format=auto,format=yuvj420p"]
+        else:
+            cmd += ["-pix_fmt", "yuvj420p"]
+        cmd += ["-frames:v", "1", "-q:v", STILL_JPEG_QSCALE, str(out_path)]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
+        if (result.returncode != 0 or not out_path.exists()
+                or out_path.stat().st_size == 0):
+            raise MotionPhotoError(
+                f"ffmpeg failed while converting the {still_format} still to JPEG:\n"
+                f"  command: {' '.join(cmd)}\n"
+                f"  {_stderr_tail(result.stderr)}"
+            )
+        return out_path.read_bytes()
+    finally:
+        in_path.unlink(missing_ok=True)
+        out_path.unlink(missing_ok=True)
 
 
 def build_atempo_chain(speed: float) -> str:
@@ -1380,7 +1475,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("image", nargs="?", help="input JPEG file")
+    parser.add_argument("image", nargs="?",
+                        help="input image file (JPEG; PNG/WebP/BMP/GIF/TIFF "
+                             "stills are converted to JPEG via ffmpeg)")
     parser.add_argument("video", nargs="?",
                         help="input MP4 video file (omit it to check and clean "
                              "the image's AI-generation tags only)")
@@ -1472,6 +1569,21 @@ def main(argv=None) -> int:
         video_path = Path(args.video)
         image_bytes = _read(image_path)
         video_bytes = _read(video_path)
+
+        # Non-JPEG stills (PNG above all) are converted to JPEG up front, so
+        # every downstream step deals with plain JPEG bytes.
+        if not image_bytes.startswith(SOI):
+            still_format = detect_still_format(image_bytes)
+            if still_format is None:
+                raise MotionPhotoError(
+                    f"{image_path} is not a JPEG image; PNG, WebP, BMP, GIF and "
+                    "TIFF stills are also accepted and converted via ffmpeg"
+                )
+            image_bytes = convert_still_to_jpeg(
+                image_path, resolve_ffmpeg(args.ffmpeg), image_bytes, still_format)
+            width, height = image_dimensions(image_bytes)
+            print(f"  photo : converted {still_format} -> JPEG "
+                  f"({width}x{height}, {len(image_bytes):,} bytes)")
 
         # AI-generation tags are stripped up front, whatever the output format.
         image_bytes, ai_removed = strip_ai_metadata(image_bytes)

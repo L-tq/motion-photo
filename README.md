@@ -13,6 +13,7 @@ and fast-forwarding use [ffmpeg](https://ffmpeg.org) when requested.
 
 ```
 python motion_photo.py photo.jpg clip.mp4                        # Honor 动态照片 (default; auto aspect-crop on mismatch)
+python motion_photo.py photo.png clip.mp4                        # PNG still: converted to JPEG first
 python motion_photo.py photo.jpg clip.mp4 --compress             # shrink the video
 python motion_photo.py photo.jpg clip.mp4 --duration             # fast-forward to 3 s
 python motion_photo.py photo.jpg clip.mp4 --compress --duration 4
@@ -30,6 +31,10 @@ python motion_photo.py --info MVIMG_20261004_120000.jpg          # inspect a mot
 ```
 
 - Output defaults to `<image>_motion.jpg` next to the input (`-o` overrides).
+- The still image may be **PNG** (also WebP/BMP/GIF/TIFF): it is converted to
+  a high-quality JPEG via ffmpeg (qscale 2, ~quality 95; dimensions kept)
+  before the motion photo is built — JPEG has no alpha, so transparent PNGs
+  are flattened onto white. The output is still named `<stem>_motion.jpg`.
 - `--info FILE` prints the XMP metadata and verifies that the declared lengths
   actually line up with the file bytes, exiting non-zero on any mismatch. It
   also reports any AI-generation markers it finds.
@@ -80,8 +85,8 @@ segment on the still (only Orientation is carried over).
 
 ## Optional video processing
 
-Large or long source clips are handled by these flags (all require ffmpeg;
-everything else stays dependency-free):
+Large or long source clips are handled by these flags (all require ffmpeg, as
+does non-JPEG still conversion; everything else stays dependency-free):
 
 | Flag | Effect |
 | --- | --- |
@@ -180,7 +185,7 @@ safely re-run the tool on its own output.
 python test_motion_photo.py
 ```
 
-111 tests covering JPEG parsing (JFIF/EXIF ordering, progressive-safe marker
+120 tests covering JPEG parsing (JFIF/EXIF ordering, progressive-safe marker
 walking), the self-referential primary-length calculation across digit
 boundaries, trailer replacement, error handling, the CLI, the MP4 box parser
 (duration, audio, rotation-aware display size), the black-bar analyser,

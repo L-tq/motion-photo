@@ -141,6 +141,12 @@ payload = ((24).to_bytes(4, "big") + b"ftyp" + b"isom" + b"FAKEFFMPEG"
            + b"\nARGS:" + " ".join(args).encode())
 if dst == "-":  # piped raw output (e.g. the bar-detection frame decoder)
     sys.stdout.buffer.write(payload)
+elif dst.lower().endswith((".jpg", ".jpeg")):
+    # still-image conversion: a real JPEG carrying the recorded argv in a COM
+    jpg = JPEG_BYTES
+    note = b"ARGS:" + " ".join(args).encode()
+    com = b"\xff\xfe" + (len(note) + 2).to_bytes(2, "big") + note
+    Path(dst).write_bytes(jpg[:2] + com + jpg[2:])
 else:
     Path(dst).write_bytes(payload)
 """
@@ -149,7 +155,7 @@ else:
 def write_fake_ffmpeg(directory: Path) -> Path:
     """Install a fake ffmpeg into ``directory`` and return its path."""
     script = directory / "_fake_ffmpeg.py"
-    script.write_text(FAKE_FFMPEG_SCRIPT)
+    script.write_text(FAKE_FFMPEG_SCRIPT.replace("JPEG_BYTES", repr(MINIMAL_JPEG)))
     if os.name == "nt":
         bat = directory / "ffmpeg.bat"
         bat.write_text('@echo off\r\n"%s" "%s" %%*\r\n' % (sys.executable, script))
@@ -158,6 +164,21 @@ def write_fake_ffmpeg(directory: Path) -> Path:
     sh.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, script))
     sh.chmod(0o755)
     return sh
+
+
+def png_bytes(width=100, height=50, color_type=2, trns=False):
+    """Minimal PNG: signature + IHDR (+ optional tRNS) + IDAT + IEND."""
+    def chunk(ctype, payload=b""):
+        return len(payload).to_bytes(4, "big") + ctype + payload + b"\x00\x00\x00\x00"
+
+    ihdr = (width.to_bytes(4, "big") + height.to_bytes(4, "big")
+            + b"\x08" + bytes([color_type]) + b"\x00\x00\x00")
+    parts = [b"\x89PNG\r\n\x1a\n", chunk(b"IHDR", ihdr)]
+    if trns:
+        parts.append(chunk(b"tRNS", b"\x00\x00\x00\x00"))
+    parts.append(chunk(b"IDAT", b"\x00" * 16))
+    parts.append(chunk(b"IEND"))
+    return b"".join(parts)
 
 
 class FixtureTests(unittest.TestCase):
@@ -911,6 +932,108 @@ class CliProcessingTests(unittest.TestCase):
         self.assertIn("--no-match-aspect", stderr.getvalue())
 
 
+class StillConversionTests(unittest.TestCase):
+    """Non-JPEG stills (PNG above all) are converted to JPEG via ffmpeg."""
+
+    def test_detect_still_format(self):
+        cases = [
+            (png_bytes(), "PNG"),
+            (b"RIFF$\x00\x00\x00WEBPVP8 ", "WebP"),
+            (b"GIF89a\x01\x02\x03", "GIF"),
+            (b"GIF87a\x01\x02\x03", "GIF"),
+            (b"BM6\x00\x00\x00" + b"\x00" * 30, "BMP"),
+            (b"II*\x00\x08\x00\x00\x00", "TIFF"),
+            (b"MM\x00*\x08\x00", "TIFF"),
+            (b"\xff\xd8\xff\xe0" + b"\x00" * 16, None),   # JPEG: no conversion
+            (b"RIFF$\x00\x00\x00WAVEfmt ", None),         # audio, not a still
+            (b"just some text", None),
+            (b"", None),
+        ]
+        for data, expected in cases:
+            self.assertEqual(mp.detect_still_format(data), expected, data[:12])
+
+    def test_png_has_alpha(self):
+        self.assertTrue(mp.png_has_alpha(png_bytes(color_type=6)))   # RGBA
+        self.assertTrue(mp.png_has_alpha(png_bytes(color_type=4)))   # gray+alpha
+        self.assertFalse(mp.png_has_alpha(png_bytes(color_type=2)))  # RGB
+        self.assertFalse(mp.png_has_alpha(png_bytes(color_type=0)))  # grayscale
+        self.assertTrue(mp.png_has_alpha(png_bytes(color_type=3, trns=True)))
+        self.assertFalse(mp.png_has_alpha(png_bytes(color_type=3)))
+        self.assertTrue(mp.png_has_alpha(png_bytes(color_type=2, trns=True)))
+        self.assertFalse(mp.png_has_alpha(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20))
+        self.assertFalse(mp.png_has_alpha(b"not a png at all"))
+
+    def test_png_ihdr_dims(self):
+        self.assertEqual(mp._png_ihdr(png_bytes(width=640, height=480)),
+                         (640, 480, 2))
+        self.assertIsNone(mp._png_ihdr(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20))
+
+
+class PngInputCliTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.fake_ffmpeg = write_fake_ffmpeg(self.dir)
+        self.video = self.dir / "clip.mp4"
+        self.video.write_bytes(make_moov_mp4(3.0))  # no dims: aspect check skipped
+
+    def _still(self, name="photo_motion.jpg"):
+        output = (self.dir / name).read_bytes()
+        return output[:mp.find_jpeg_eoi(output)]
+
+    def test_png_input_converted_and_embedded(self):
+        png = self.dir / "photo.png"
+        png.write_bytes(png_bytes(color_type=2))  # opaque: plain re-encode
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = mp.main([str(png), str(self.video),
+                            "--ffmpeg", str(self.fake_ffmpeg)])
+        self.assertEqual(code, 0)
+        self.assertIn("converted PNG -> JPEG", stdout.getvalue())
+        still = self._still()
+        self.assertTrue(still.startswith(mp.SOI))
+        self.assertIn(b"ARGS:", still)          # produced by the fake converter
+        self.assertIn(b"-q:v 2", still)         # recorded argv: high quality
+        self.assertIn(b"yuvj420p", still)
+        self.assertNotIn(b"filter_complex", still)
+        output = (self.dir / "photo_motion.jpg").read_bytes()
+        self.assertEqual(output[mp.find_jpeg_eoi(output):], self.video.read_bytes())
+
+    def test_transparent_png_gets_flatten_filter(self):
+        png = self.dir / "alpha.png"
+        png.write_bytes(png_bytes(width=64, height=32, color_type=6))
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = mp.main([str(png), str(self.video),
+                            "--ffmpeg", str(self.fake_ffmpeg)])
+        self.assertEqual(code, 0)
+        still = self._still("alpha_motion.jpg")
+        self.assertIn(b"filter_complex", still)
+        self.assertIn(b"color=c=white:s=64x32", still)  # flattened onto white
+        self.assertIn(b"overlay", still)
+
+    def test_png_without_ffmpeg_fails_with_hint(self):
+        png = self.dir / "photo.png"
+        png.write_bytes(png_bytes())
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(stderr):
+            code = mp.main([str(png), str(self.video),
+                            "--ffmpeg", str(self.dir / "absent.exe")])
+        self.assertEqual(code, 2)
+        self.assertIn("ffmpeg", stderr.getvalue())
+
+    def test_unsupported_image_format_fails(self):
+        raw = self.dir / "photo.dat"
+        raw.write_bytes(b"\x00\x01\x02 not an image")
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(stderr):
+            code = mp.main([str(raw), str(self.video)])
+        self.assertEqual(code, 2)
+        self.assertIn("not a JPEG", stderr.getvalue())
+
+
 class AppleFormatTests(unittest.TestCase):
     ASSET = "B96E1C6B-4C8E-4A32-9F0D-1234567890AB"
 
@@ -1580,6 +1703,73 @@ class RealFfmpegTests(unittest.TestCase):
             self.assertEqual(code, 0)
             output = (Path(tmp) / "photo_motion.jpg").read_bytes()
             self.assertEqual(output[mp.find_jpeg_eoi(output):], src.read_bytes())
+
+    def test_png_input_converted_by_real_ffmpeg(self):
+        ffmpeg = Path(REAL_FFMPEG)
+        with tempfile.TemporaryDirectory() as tmp:
+            png = Path(tmp) / "photo.png"
+            made = subprocess.run(
+                [str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "testsrc2=duration=1:size=640x640:rate=24",
+                 "-frames:v", "1", str(png)],
+                capture_output=True, text=True)
+            self.assertEqual(made.returncode, 0, made.stderr)
+
+            src = Path(tmp) / "src.mp4"  # square like the converted still
+            made = subprocess.run(
+                [str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "testsrc2=duration=1:size=640x640:rate=24",
+                 "-c:v", "libx264", "-preset", "veryfast", str(src)],
+                capture_output=True, text=True)
+            self.assertEqual(made.returncode, 0, made.stderr)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = mp.main([str(png), str(src), "--ffmpeg", str(ffmpeg)])
+            self.assertEqual(code, 0, stdout.getvalue())
+            self.assertIn("converted PNG -> JPEG (640x640", stdout.getvalue())
+
+            output = (Path(tmp) / "photo_motion.jpg").read_bytes()
+            eoi = mp.find_jpeg_eoi(output)
+            self.assertEqual(mp.image_dimensions(output[:eoi]), (640, 640))
+            self.assertEqual(output[eoi:], src.read_bytes())  # square: untouched
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(mp.main(["--info", str(Path(tmp) / "photo_motion.jpg")]), 0)
+
+    def test_transparent_png_flattened_onto_white(self):
+        ffmpeg = Path(REAL_FFMPEG)
+        with tempfile.TemporaryDirectory() as tmp:
+            png = Path(tmp) / "clear.png"  # a fully transparent frame
+            made = subprocess.run(
+                [str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=c=black@0.0:size=32x32,format=rgba",
+                 "-frames:v", "1", str(png)],
+                capture_output=True, text=True)
+            self.assertEqual(made.returncode, 0, made.stderr)
+            self.assertTrue(mp.png_has_alpha(png.read_bytes()))
+
+            src = Path(tmp) / "src.mp4"  # square like the converted still
+            made = subprocess.run(
+                [str(ffmpeg), "-y", "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "testsrc2=duration=1:size=64x64:rate=24",
+                 "-c:v", "libx264", "-preset", "veryfast", str(src)],
+                capture_output=True, text=True)
+            self.assertEqual(made.returncode, 0, made.stderr)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = mp.main([str(png), str(src), "--ffmpeg", str(ffmpeg)])
+            self.assertEqual(code, 0)
+
+            output = (Path(tmp) / "clear_motion.jpg").read_bytes()
+            still = Path(tmp) / "still.jpg"
+            still.write_bytes(output[:mp.find_jpeg_eoi(output)])
+            raw = subprocess.run(
+                [str(ffmpeg), "-hide_banner", "-loglevel", "error",
+                 "-i", str(still), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                capture_output=True)
+            self.assertEqual(raw.returncode, 0)
+            r, g, b = raw.stdout[:3]
+            self.assertGreater(min(r, g, b), 200)  # transparent -> white, not black
 
     def test_match_aspect_crops_to_photo(self):
         ffmpeg = Path(REAL_FFMPEG)
